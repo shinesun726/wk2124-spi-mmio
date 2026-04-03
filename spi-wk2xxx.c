@@ -90,6 +90,16 @@ static DEFINE_MUTEX(wk2xxxs_global_lock);
 
 #define ROCKCHIP_SPI_TIMEOUT_US 1000000
 
+#define WK2XXX_DEBUG_LOG 1
+
+#if WK2XXX_DEBUG_LOG
+#define wk2xxx_dbg(dev, fmt, ...) dev_info((dev), "wk2xxx: " fmt, ##__VA_ARGS__)
+#define wk2xxx_dbg_rl(dev, fmt, ...) dev_info_ratelimited((dev), "wk2xxx: " fmt, ##__VA_ARGS__)
+#else
+#define wk2xxx_dbg(dev, fmt, ...) do { } while (0)
+#define wk2xxx_dbg_rl(dev, fmt, ...) do { } while (0)
+#endif
+
 enum
 {
     DFS_SHIFT = 0,
@@ -319,7 +329,8 @@ struct rockchip_spi_regs
 struct wk2xxx_mmio_spi
 {
     struct device *ctlr_dev;
-    struct clk *clk;
+    struct clk *spiclk;
+    struct clk *apb_pclk;
     struct rockchip_spi_regs __iomem *regs;
     u32 fifo_len;
     u32 fifo_rx_th;
@@ -555,7 +566,15 @@ static int wk2xxx_mmio_claim_bus(struct wk2xxx_port *s)
     s->mmio.cr0 = ctrlr0;
 
     writel(ctrlr0, &s->mmio.regs->ctrlr0);
+    writel(0, &s->mmio.regs->ctrlr1);
+    writel(0, &s->mmio.regs->dmacr);
+    writel(0, &s->mmio.regs->txftlr);
+    writel(0, &s->mmio.regs->rxftlr);
     writel(0, &s->mmio.regs->ser);
+
+    wk2xxx_dbg(&s->spi_wk->dev,
+               "claim_bus cs=%u clock_div=%u fifo_len=%u cr0=%#x\n",
+               s->mmio.cs, s->mmio.clock_div, s->mmio.fifo_len, s->mmio.cr0);
 
     return 0;
 }
@@ -564,6 +583,8 @@ static void wk2xxx_mmio_config(struct wk2xxx_port *s, const void *dout, void *di
 {
     u32 ctrlr0 = s->mmio.cr0;
     u32 tmod;
+
+    wk2xxx_mmio_enable_chip(s->mmio.regs, false);
 
     if (dout && din)
         tmod = TMOD_TR;
@@ -575,7 +596,9 @@ static void wk2xxx_mmio_config(struct wk2xxx_port *s, const void *dout, void *di
     ctrlr0 |= tmod << TMOD_SHIFT;
     writel(ctrlr0, &s->mmio.regs->ctrlr0);
     if (tmod == TMOD_RO)
-        writel(len, &s->mmio.regs->ctrlr1);
+        writel(len ? len - 1 : 0, &s->mmio.regs->ctrlr1);
+    else
+        writel(0, &s->mmio.regs->ctrlr1);
 }
 
 static int wk2xxx_mmio_xfer(struct wk2xxx_port *s, int len, const void *dout, void *din, unsigned long flags)
@@ -585,6 +608,9 @@ static int wk2xxx_mmio_xfer(struct wk2xxx_port *s, int len, const void *dout, vo
     int toread = din ? len : 0;
     int towrite = dout ? len : 0;
     int ret;
+    unsigned long deadline;
+    int last_toread = toread;
+    int last_towrite = towrite;
 
     if (!s || !s->mmio.regs)
         return -ENODEV;
@@ -594,10 +620,18 @@ static int wk2xxx_mmio_xfer(struct wk2xxx_port *s, int len, const void *dout, vo
         return ret;
 
     wk2xxx_mmio_config(s, dout, din, len);
+    if (len <= 4)
+        wk2xxx_dbg_rl(&s->spi_wk->dev,
+                      "xfer start len=%d flags=%#lx tx=%d rx=%d ctrlr0=%#x ctrlr1=%#x\n",
+                      len, flags, towrite, toread,
+                      readl(&s->mmio.regs->ctrlr0),
+                      readl(&s->mmio.regs->ctrlr1));
+
     if (flags & SPI_XFER_BEGIN)
         wk2xxx_mmio_cs_activate(s);
 
     wk2xxx_mmio_enable_chip(s->mmio.regs, true);
+    deadline = jiffies + usecs_to_jiffies(ROCKCHIP_SPI_TIMEOUT_US);
     while (toread || towrite)
     {
         if (towrite)
@@ -625,9 +659,39 @@ static int wk2xxx_mmio_xfer(struct wk2xxx_port *s, int len, const void *dout, vo
                 *in++ = readl(&s->mmio.regs->rxdr[0]);
             toread -= room;
         }
+
+        if (toread != last_toread || towrite != last_towrite)
+        {
+            last_toread = toread;
+            last_towrite = towrite;
+            deadline = jiffies + usecs_to_jiffies(ROCKCHIP_SPI_TIMEOUT_US);
+            continue;
+        }
+
+        if (time_after(jiffies, deadline))
+        {
+            dev_err(&s->spi_wk->dev,
+                    "wk2xxx mmio xfer timeout len=%d towrite=%d toread=%d sr=%#x txflr=%#x rxflr=%#x\n",
+                    len, towrite, toread,
+                    readl(&s->mmio.regs->sr),
+                    readl(&s->mmio.regs->txflr),
+                    readl(&s->mmio.regs->rxflr));
+            ret = -ETIMEDOUT;
+            goto out_disable;
+        }
+
+        cpu_relax();
     }
 
     ret = wk2xxx_mmio_wait_till_not_busy(s);
+    if (!ret && len <= 4)
+        wk2xxx_dbg_rl(&s->spi_wk->dev,
+                      "xfer done len=%d sr=%#x txflr=%#x rxflr=%#x\n",
+                      len,
+                      readl(&s->mmio.regs->sr),
+                      readl(&s->mmio.regs->txflr),
+                      readl(&s->mmio.regs->rxflr));
+out_disable:
     if (flags & SPI_XFER_END)
         wk2xxx_mmio_cs_deactivate(s);
     wk2xxx_mmio_enable_chip(s->mmio.regs, false);
@@ -659,35 +723,68 @@ static int wk2xxx_mmio_init(struct spi_device *spi, struct wk2xxx_port *s)
     s->mmio.ctlr_dev = ctlr_dev;
     s->mmio.cs = spi->chip_select;
     s->mmio.rsd = 0;
-    s->mmio.clk = of_clk_get(ctlr_np, 0);
-    if (IS_ERR(s->mmio.clk))
+    s->mmio.spiclk = of_clk_get_by_name(ctlr_np, "spiclk");
+    if (IS_ERR(s->mmio.spiclk))
     {
-        ret = PTR_ERR(s->mmio.clk);
+        ret = PTR_ERR(s->mmio.spiclk);
         if (ret == -EPROBE_DEFER)
         {
-            s->mmio.clk = NULL;
+            s->mmio.spiclk = NULL;
             return ret;
         }
         dev_warn(&spi->dev,
-                 "wk2xxx: failed to get parent spi clock (%d), fallback to current controller baud setting\n",
+                 "wk2xxx: failed to get parent spiclk (%d), fallback to current controller baud setting\n",
                  ret);
-        s->mmio.clk = NULL;
+        s->mmio.spiclk = NULL;
     }
 
-    if (s->mmio.clk)
+    s->mmio.apb_pclk = of_clk_get_by_name(ctlr_np, "apb_pclk");
+    if (IS_ERR(s->mmio.apb_pclk))
     {
-        ret = clk_prepare_enable(s->mmio.clk);
+        ret = PTR_ERR(s->mmio.apb_pclk);
+        if (ret == -EPROBE_DEFER)
+        {
+            s->mmio.apb_pclk = NULL;
+            if (s->mmio.spiclk)
+            {
+                clk_put(s->mmio.spiclk);
+                s->mmio.spiclk = NULL;
+            }
+            return ret;
+        }
+        dev_warn(&spi->dev,
+                 "wk2xxx: failed to get parent apb_pclk (%d), continuing anyway\n",
+                 ret);
+        s->mmio.apb_pclk = NULL;
+    }
+
+    if (s->mmio.apb_pclk)
+    {
+        ret = clk_prepare_enable(s->mmio.apb_pclk);
         if (ret)
         {
             dev_warn(&spi->dev,
-                     "wk2xxx: failed to enable parent spi clock (%d), fallback to current controller baud setting\n",
+                     "wk2xxx: failed to enable parent apb_pclk (%d), continuing anyway\n",
                      ret);
-            clk_put(s->mmio.clk);
-            s->mmio.clk = NULL;
+            clk_put(s->mmio.apb_pclk);
+            s->mmio.apb_pclk = NULL;
+        }
+    }
+
+    if (s->mmio.spiclk)
+    {
+        ret = clk_prepare_enable(s->mmio.spiclk);
+        if (ret)
+        {
+            dev_warn(&spi->dev,
+                     "wk2xxx: failed to enable parent spiclk (%d), fallback to current controller baud setting\n",
+                     ret);
+            clk_put(s->mmio.spiclk);
+            s->mmio.spiclk = NULL;
         }
         else
         {
-            clk_rate = clk_get_rate(s->mmio.clk);
+            clk_rate = clk_get_rate(s->mmio.spiclk);
         }
     }
 
@@ -714,14 +811,26 @@ static int wk2xxx_mmio_init(struct spi_device *spi, struct wk2xxx_port *s)
     if (ret)
         goto err_clk;
 
+    wk2xxx_dbg(&spi->dev,
+               "mmio_init regs=%p cs=%u clk_rate=%lu clock_div=%u baudr=%u fifo_len=%u fifo_rx_th=%u\n",
+               s->mmio.regs, s->mmio.cs, clk_rate,
+               s->mmio.clock_div, baudr,
+               s->mmio.fifo_len, s->mmio.fifo_rx_th);
+
     return 0;
 
 err_clk:
-    if (s->mmio.clk)
+    if (s->mmio.spiclk)
     {
-        clk_disable_unprepare(s->mmio.clk);
-        clk_put(s->mmio.clk);
-        s->mmio.clk = NULL;
+        clk_disable_unprepare(s->mmio.spiclk);
+        clk_put(s->mmio.spiclk);
+        s->mmio.spiclk = NULL;
+    }
+    if (s->mmio.apb_pclk)
+    {
+        clk_disable_unprepare(s->mmio.apb_pclk);
+        clk_put(s->mmio.apb_pclk);
+        s->mmio.apb_pclk = NULL;
     }
 
     return ret;
@@ -729,11 +838,17 @@ err_clk:
 
 static void wk2xxx_mmio_exit(struct wk2xxx_port *s)
 {
-    if (s->mmio.clk)
+    if (s->mmio.spiclk)
     {
-        clk_disable_unprepare(s->mmio.clk);
-        clk_put(s->mmio.clk);
-        s->mmio.clk = NULL;
+        clk_disable_unprepare(s->mmio.spiclk);
+        clk_put(s->mmio.spiclk);
+        s->mmio.spiclk = NULL;
+    }
+    if (s->mmio.apb_pclk)
+    {
+        clk_disable_unprepare(s->mmio.apb_pclk);
+        clk_put(s->mmio.apb_pclk);
+        s->mmio.apb_pclk = NULL;
     }
 
     s->mmio.regs = NULL;
@@ -759,6 +874,7 @@ static int wk2xxx_read_global_reg(struct spi_device *spi, uint8_t reg, uint8_t *
     mutex_unlock(&wk2xxxs_reg_lock);
     if (status)
     {
+        wk2xxx_dbg_rl(&spi->dev, "read_global_reg failed reg=%#x status=%d\n", reg, status);
         return status;
     }
     *dat = buf_rdat[1];
@@ -779,6 +895,8 @@ static int wk2xxx_write_global_reg(struct spi_device *spi, uint8_t reg, uint8_t 
     buf_reg[1] = dat;
     status = wk2xxx_mmio_xfer(s, 2, buf_reg, NULL, SPI_XFER_ONCE);
     mutex_unlock(&wk2xxxs_reg_lock);
+    if (status)
+        wk2xxx_dbg_rl(&spi->dev, "write_global_reg failed reg=%#x val=%#x status=%d\n", reg, dat, status);
     return status;
 }
 /*
@@ -800,6 +918,7 @@ static int wk2xxx_read_slave_reg(struct spi_device *spi, uint8_t port, uint8_t r
     mutex_unlock(&wk2xxxs_reg_lock);
     if (status)
     {
+        wk2xxx_dbg_rl(&spi->dev, "read_slave_reg failed port=%u reg=%#x status=%d\n", port, reg, status);
         return status;
     }
     *dat = buf_rdat[1];
@@ -820,6 +939,8 @@ static int wk2xxx_write_slave_reg(struct spi_device *spi, uint8_t port, uint8_t 
     buf_reg[1] = dat;
     status = wk2xxx_mmio_xfer(s, 2, buf_reg, NULL, SPI_XFER_ONCE);
     mutex_unlock(&wk2xxxs_reg_lock);
+    if (status)
+        wk2xxx_dbg_rl(&spi->dev, "write_slave_reg failed port=%u reg=%#x val=%#x status=%d\n", port, reg, dat, status);
     return status;
 }
 
@@ -847,6 +968,8 @@ static int wk2xxx_read_fifo(struct spi_device *spi, uint8_t port, uint8_t fifole
     for (i = 0; i < fifolen; i++)
         *(dat + i) = recive_fifo_data[i + 1];
     mutex_unlock(&wk2xxxs_reg_lock);
+    if (status)
+        wk2xxx_dbg_rl(&spi->dev, "read_fifo failed port=%u len=%u status=%d\n", port, fifolen, status);
     return status;
 }
 /*
@@ -872,6 +995,9 @@ static int wk2xxx_write_fifo(struct spi_device *spi, uint8_t port, uint8_t fifol
     }
     status = wk2xxx_mmio_xfer(s, fifolen + 1, transmit_fifo_data, NULL, SPI_XFER_ONCE);
     mutex_unlock(&wk2xxxs_reg_lock);
+    if (status)
+        wk2xxx_dbg_rl(&spi->dev, "write_fifo failed port=%u len=%u status=%d first=%#x\n",
+                      port, fifolen, status, fifolen ? dat[0] : 0);
     return status;
 }
 
@@ -908,6 +1034,9 @@ static void wk2xxx_rx_chars(struct uart_port *port)
         }
         rfcnt = (rfcnt2 >= rfcnt) ? rfcnt : rfcnt2;
         rxlen = (rfcnt == 0) ? 256 : rfcnt;
+        wk2xxx_dbg_rl(port->dev,
+                      "rx_chars port=%ld fsr=%#x rfcnt=%u rfcnt2=%u rxlen=%d\n",
+                      one->port.iobase, fsr, rfcnt, rfcnt2, rxlen);
     }
 #ifdef _DEBUG_WK_RX
     printk(KERN_ALERT "rx_chars()-port:%lx--fsr:0x%x--rxlen:%d--\n", one->port.iobase, fsr, rxlen);
@@ -983,6 +1112,9 @@ static void wk2xxx_rx_chars(struct uart_port *port)
     }
     if (rx_count > 0)
     {
+        wk2xxx_dbg_rl(port->dev,
+                  "rx_push port=%ld count=%u first=%#x status=%#x\n",
+                  one->port.iobase, rx_count, rx_dat[0], status);
 #ifdef _DEBUG_WK_RX
         printk(KERN_ALERT "push buffer tty flip port = :%lx count =:%d\n", one->port.iobase, rx_count);
 #endif
@@ -1008,6 +1140,9 @@ static void wk2xxx_tx_chars(struct uart_port *port)
 #endif
     if (one->port.x_char)
     {
+        wk2xxx_dbg_rl(port->dev,
+                  "tx_chars x_char port=%ld val=%#x\n",
+                  one->port.iobase, one->port.x_char);
 #ifdef _DEBUG_WK_TX
         printk(KERN_ALERT "wk2xxx_tx_chars   one->port.x_char:%x,port = %ld\n", one->port.x_char, one->port.iobase);
 #endif
@@ -1045,6 +1180,10 @@ static void wk2xxx_tx_chars(struct uart_port *port)
     {
         tx_count = 200;
     }
+    wk2xxx_dbg_rl(port->dev,
+                  "tx_chars port=%ld fsr=%#x tfcnt=%u tx_count=%d pending=%d\n",
+                  one->port.iobase, fsr, tfcnt, tx_count,
+                  uart_circ_chars_pending(&one->port.state->xmit));
     count = tx_count;
     i = 0;
     while (count)
@@ -1087,6 +1226,10 @@ static void wk2xxx_tx_chars(struct uart_port *port)
 out:
     wk2xxx_read_slave_reg(s->spi_wk, one->port.iobase, WK2XXX_FSR_REG, dat);
     fsr = dat[0];
+    wk2xxx_dbg_rl(port->dev,
+                  "tx_chars done port=%ld fsr=%#x remaining=%d\n",
+                  one->port.iobase, fsr,
+                  uart_circ_chars_pending(&one->port.state->xmit));
 #ifdef _DEBUG_WK_VALUE
     printk(KERN_ALERT "%s!!-port:%ld;--FSR:0X%X--\n", __func__, one->port.iobase, fsr);
 #endif
@@ -1145,6 +1288,9 @@ static void wk2xxx_port_irq(struct wk2xxx_port *s, int portno) //
 #endif
     wk2xxx_read_slave_reg(s->spi_wk, one->port.iobase, WK2XXX_SIFR_REG, &sifr);
     wk2xxx_read_slave_reg(s->spi_wk, one->port.iobase, WK2XXX_SIER_REG, &sier);
+    wk2xxx_dbg_rl(&s->spi_wk->dev,
+                  "port_irq port=%ld sifr=%#x sier=%#x\n",
+                  one->port.iobase, sifr, sier);
 #ifdef _DEBUG_WK_IRQ
     printk(KERN_ALERT "irq_app....port:%ld......sifr:%x sier:%x \n", one->port.iobase, sifr, sier);
 #endif
@@ -1184,6 +1330,7 @@ static void wk2xxx_ist(struct kthread_work *ws)
 #endif
 
     wk2xxx_read_global_reg(s->spi_wk, WK2XXX_GIFR_REG, &gifr);
+    wk2xxx_dbg_rl(&s->spi_wk->dev, "ist enter gifr=%#x\n", gifr);
     while (1)
     {
 
@@ -1196,6 +1343,7 @@ static void wk2xxx_ist(struct kthread_work *ws)
         }
 
         wk2xxx_read_global_reg(s->spi_wk, WK2XXX_GIFR_REG, &gifr);
+        wk2xxx_dbg_rl(&s->spi_wk->dev, "ist loop gifr=%#x\n", gifr);
         if (!(gifr & 0x0f))
         {
             break;
@@ -1219,6 +1367,7 @@ static irqreturn_t wk2xxx_irq(int irq, void *dev_id) //
 #else
     ret = queue_kthread_work(&s->kworker, &s->irq_work);
 #endif
+    wk2xxx_dbg_rl(&s->spi_wk->dev, "irq fired irq=%d queued=%d\n", irq, ret);
 
 #ifdef _DEBUG_WK_FUNCTION
     printk(KERN_ALERT "%s!!ret:%d---exit--\n", __func__, ret);
@@ -2338,6 +2487,9 @@ static int wk2xxx_probe(struct spi_device *spi)
         printk(KERN_ALERT "wk2xxx_probe(mmio_init) fail. ret=%d\n", ret);
         goto out_gpio;
     }
+    wk2xxx_dbg(&spi->dev,
+               "probe start chip_select=%u max_speed=%u mode=%u irq_gpio_prop pending\n",
+               spi->chip_select, spi->max_speed_hz, spi->mode);
 #ifdef WK_RSTGPIO_FUNCTION
     // Obtain the GPIO number of RST signal
     ret = wk2xxx_spi_rstgpio_parse_dt(&spi->dev, &s->rst_gpio_num);
