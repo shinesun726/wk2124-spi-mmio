@@ -90,7 +90,7 @@ static DEFINE_MUTEX(wk2xxxs_global_lock);
 
 #define ROCKCHIP_SPI_TIMEOUT_US 1000000
 
-#define WK2XXX_DEBUG_LOG 1
+#define WK2XXX_DEBUG_LOG 0
 
 #if WK2XXX_DEBUG_LOG
 #define wk2xxx_dbg(dev, fmt, ...) dev_info((dev), "wk2xxx: " fmt, ##__VA_ARGS__)
@@ -413,22 +413,15 @@ static struct tasklet_struct rs485_tasklet;
 
 void start_485_tasklet(void)
 {
-    printk("linx: %s, %d\n", __func__, __LINE__);
     tasklet_hi_schedule(&rs485_tasklet);
 }
 
 static int wk2xxx_rs485_config(struct uart_port *port, struct serial_rs485 *rs485)
 {
-    printk("linx: %s, %d\n", __func__, __LINE__);
     if (rs485->flags & SER_RS485_ENABLED)
     {
-        printk("linx: uart%d set 485 on\n", port->line);
         gpio_clr_rs485_txen();
         // tasklet_init(&rs485_tasklet, rs485_do_tasklet, (unsigned long) port);
-    }
-    else
-    {
-        printk(KERN_INFO "uart %d set 485 off\n", port->line);
     }
 
     memcpy(&port->rs485, rs485, sizeof(*rs485));
@@ -2461,8 +2454,6 @@ static int wk2xxx_probe(struct spi_device *spi)
     printk(KERN_ALERT "%s!!--in--\n", __func__);
 #endif
 
-    printk(KERN_ALERT "%s!!--in linx okokok--\n", __func__);
-
     /* Setup SPI bus */
     spi->bits_per_word = 8;
     /* only supports mode 0 on WK2124 */
@@ -2534,13 +2525,10 @@ static int wk2xxx_probe(struct spi_device *spi)
     {
         wk2xxx_read_global_reg(spi, WK2XXX_GENA_REG, dat);
         wk2xxx_read_global_reg(spi, WK2XXX_GENA_REG, dat);
-        printk(KERN_ERR "wk2xxx_probe(0x30)  GENA = 0x%X\n", dat[0]); // GENA=0X30
         wk2xxx_write_global_reg(spi, WK2XXX_GENA_REG, 0xf5);
         wk2xxx_read_global_reg(spi, WK2XXX_GENA_REG, dat);
-        printk(KERN_ERR "wk2xxx_probe(0x35)  GENA = 0x%X\n", dat[0]); // GENA=0X35
         wk2xxx_write_global_reg(spi, WK2XXX_GENA_REG, 0xff);
         wk2xxx_read_global_reg(spi, WK2XXX_GENA_REG, dat);
-        printk(KERN_ERR "wk2xxx_probe(0x3f)  GENA = 0x%X\n", dat[0]); // GENA=0X3f
         wk2xxx_write_global_reg(spi, WK2XXX_GENA_REG, 0xf0);
 		if (dat[0] == 0)
 		{
@@ -2593,7 +2581,6 @@ static int wk2xxx_probe(struct spi_device *spi)
         }
     }
 
-    printk(KERN_ALERT "linx: wk2xxx_serial_init. SPI_LEN_LIMIT=%d\n", SPI_LEN_LIMIT);
     for (i = 0; i < NR_PORTS; i++)
     {
         s->p[i].line = i;
@@ -2626,7 +2613,6 @@ static int wk2xxx_probe(struct spi_device *spi)
             goto out_port;
         }
 
-        printk(KERN_ALERT "uart_add_one_port：%ld. status= 0x%d\n", s->p[i].port.iobase, ret);
     }
 
     mutex_unlock(&wk2xxxs_lock);
@@ -2636,7 +2622,6 @@ static int wk2xxx_probe(struct spi_device *spi)
 
     if (!ret)
     {
-        printk(KERN_ALERT "devm_request_irq success. ret=%d.\n", ret);
         return 0;
     }
 
